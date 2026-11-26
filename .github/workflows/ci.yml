@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  git-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run standalone POSIX git-policy test suite
+        run: sh assets/git-policy-test.sh
+      - name: Validate sshd_gitgateway.conf inside built git-gateway image
+        run: |
+          docker build -f assets/Containerfile.gitgateway -t agy-gitgw-ci assets
+          ssh-keygen -q -t ed25519 -N '' -f /tmp/ci_host_key
+          docker run --rm --entrypoint /usr/sbin/sshd \
+            -v /tmp/ci_host_key:/run/secrets/host_key:ro \
+            agy-gitgw-ci -t -f /etc/ssh/sshd_config
+
+  squid-parse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build proxy image
+        run: docker build -f assets/Containerfile.proxy -t agy-proxy-ci assets
+      - name: Validate squid.conf, squid.permissive.conf, all --allow groups, and API broker config
+        run: |
+          mkdir -p /tmp/squid-ci
+          for group in "" google-auth gcp-enterprise github npm pypi crates go telemetry updater remote-control; do
+            if [ -z "$group" ]; then
+              printf '# empty\n' > /tmp/squid-ci/allow.conf
+            else
+              cargo run --quiet --example emit-squid-fragments -- allow "$group" > /tmp/squid-ci/allow.conf
+            fi
+            printf '# broker off\n' > /tmp/squid-ci/api-broker.conf
+            docker run --rm --entrypoint squid \
+              -v "$PWD/assets/squid.conf:/etc/squid/squid.conf:ro" \
+              -v /tmp/squid-ci/allow.conf:/etc/squid/conf.d/allow.conf:ro \
+              -v /tmp/squid-ci/api-broker.conf:/etc/squid/conf.d/api-broker.conf:ro \
+              agy-proxy-ci -k parse -f /etc/squid/squid.conf
+          done
+
+          cargo run --quiet --example emit-squid-fragments -- broker > /tmp/squid-ci/api-broker.conf
+          printf '# empty\n' > /tmp/squid-ci/allow.conf
+          docker run --rm --entrypoint squid \
+            -v "$PWD/assets/squid.conf:/etc/squid/squid.conf:ro" \
+            -v /tmp/squid-ci/allow.conf:/etc/squid/conf.d/allow.conf:ro \
+            -v /tmp/squid-ci/api-broker.conf:/etc/squid/conf.d/api-broker.conf:ro \
+            agy-proxy-ci -k parse -f /etc/squid/squid.conf
+
+          docker run --rm --entrypoint squid \
+            -v "$PWD/assets/squid.permissive.conf:/etc/squid/squid.conf:ro" \
+            -v /tmp/squid-ci/api-broker.conf:/etc/squid/conf.d/api-broker.conf:ro \
+            agy-proxy-ci -k parse -f /etc/squid/squid.conf

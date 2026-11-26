@@ -1,0 +1,80 @@
+ARG BASE_IMAGE=mirror.gcr.io/library/debian:bookworm-slim
+FROM ${BASE_IMAGE}
+
+ARG AGY_MANIFEST_BASE=https://antigravity-cli-auto-updater-974169037036.us-central1.run.app
+ARG AGY_VERSION=latest
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Dev and verification toolchain for autonomous coding & /swarm execution.
+# Deliberately excludes sudo, iptables, and setuid helpers: the outer rootless
+# Podman container and Squid egress gateway form the security boundary.
+RUN dpkg-statoverride --add root root 0755 /usr/bin/ssh-agent \
+    && apt-get -o APT::Sandbox::User=root update && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \
+      bash \
+      ca-certificates \
+      curl \
+      dnsutils \
+      git \
+      gzip \
+      iproute2 \
+      jq \
+      less \
+      libatomic1 \
+      openssh-client \
+      procps \
+      ripgrep \
+      tar \
+    && rm -rf /var/lib/apt/lists/*
+
+# Strip all setuid/setgid bits as defense in depth alongside --cap-drop=ALL
+# and --security-opt=no-new-privileges:true.
+RUN find / -xdev -perm /6000 -type f -exec chmod ug-s {} + 2>/dev/null || true
+
+# Fetch the Antigravity CLI flat native binary via its official release manifest
+# and verify the SHA-512 digest before installing it read-only (root:root 0555)
+# so the unprivileged container user cannot modify or trojan the binary.
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64|amd64) platform="linux_amd64" ;; \
+      aarch64|arm64) platform="linux_arm64" ;; \
+      *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    manifest="$(curl -fsSL "${AGY_MANIFEST_BASE}/manifests/${platform}.json")"; \
+    version="$(printf '%s' "$manifest" | jq -r '.version')"; \
+    url="$(printf '%s' "$manifest" | jq -r '.url')"; \
+    sha512="$(printf '%s' "$manifest" | jq -r '.sha512')"; \
+    if [ -z "$url" ] || [ "$url" = "null" ] || [ -z "$sha512" ] || [ "$sha512" = "null" ]; then \
+      echo "Malformed release manifest for ${platform}" >&2; exit 1; \
+    fi; \
+    if [ "$AGY_VERSION" != "latest" ] && [ "$version" != "$AGY_VERSION" ]; then \
+      echo "Manifest version ${version} does not match requested AGY_VERSION=${AGY_VERSION}" >&2; exit 1; \
+    fi; \
+    tmp_dir="$(mktemp -d)"; \
+    trap 'rm -rf "$tmp_dir"' EXIT; \
+    curl -fsSL -o "${tmp_dir}/agy.tar.gz" "$url"; \
+    printf '%s  %s\n' "$sha512" "${tmp_dir}/agy.tar.gz" | sha512sum -c -; \
+    tar -xzf "${tmp_dir}/agy.tar.gz" -C "$tmp_dir" antigravity; \
+    install -o root -g root -m 0555 "${tmp_dir}/antigravity" /usr/local/bin/agy; \
+    /usr/local/bin/agy --version
+
+COPY verify-boundary.sh /usr/local/bin/verify-boundary
+RUN chmod 0555 /usr/local/bin/verify-boundary
+
+# Create non-root agy user (UID/GID 1000) to align with --userns=keep-id:uid=1000,gid=1000.
+# Guard chown for single-mapping rootless environments lacking /etc/subuid.
+RUN groupadd -g 1000 agy \
+    && useradd -M -d /home/agy -u 1000 -g 1000 -s /bin/bash agy \
+    && mkdir -p /workspace /home/agy/.gemini /home/agy/.config/antigravity /mnt \
+    && (chown -R 1000:1000 /workspace /home/agy 2>/dev/null || true)
+
+ENV HOME=/home/agy \
+    NO_BROWSER=true \
+    SSH_CONNECTION="agy-container 0 agy-container 0" \
+    AGY_CLI_DISABLE_AUTO_UPDATE=true \
+    TERM=xterm-256color
+
+USER agy
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/local/bin/agy"]

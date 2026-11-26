@@ -1,0 +1,37 @@
+ARG BASE_IMAGE=mirror.gcr.io/library/alpine:3.20
+FROM ${BASE_IMAGE}
+
+ARG GITHUB_SSH_HOST_KEY="github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+ARG GITHUB_SSH_FINGERPRINT="SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
+
+RUN apk add --no-cache \
+      openssh-server=9.7_p1-r6 \
+      openssh-client-default=9.7_p1-r6
+
+# Pin GitHub's published ed25519 host key without build-time TOFU (ssh-keyscan)
+# and verify its SHA-256 fingerprint before baking into /etc/ssh/github_known_hosts.
+RUN mkdir -p /etc/ssh \
+    && printf '%s\n' "$GITHUB_SSH_HOST_KEY" > /etc/ssh/github_known_hosts \
+    && test -s /etc/ssh/github_known_hosts \
+    && actual="$(ssh-keygen -lf /etc/ssh/github_known_hosts | awk '{print $2}')" \
+    && if [ "$actual" != "$GITHUB_SSH_FINGERPRINT" ]; then \
+         echo "GitHub host key fingerprint mismatch: expected ${GITHUB_SSH_FINGERPRINT}, got ${actual}" >&2; \
+         exit 1; \
+       fi \
+    && chmod 0644 /etc/ssh/github_known_hosts
+
+# Dedicated account for incoming gateway sessions. Uses /bin/sh because sshd
+# executes ForceCommand through the login shell; shell access is blocked by
+# both ForceCommand in sshd_config and restrict,command= in authorized_keys.
+RUN adduser -D -H -s /bin/sh gitgw \
+    && sed -i 's/^gitgw:!:/gitgw:*:/' /etc/shadow \
+    && mkdir -p /var/empty /run \
+    && chmod 0755 /var/empty
+
+COPY sshd_gitgateway.conf /etc/ssh/sshd_config
+COPY git-policy /usr/local/bin/git-policy
+COPY git-gateway-entrypoint /usr/local/bin/git-gateway-entrypoint
+RUN chmod 0644 /etc/ssh/sshd_config \
+    && chmod 0555 /usr/local/bin/git-policy /usr/local/bin/git-gateway-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/git-gateway-entrypoint"]

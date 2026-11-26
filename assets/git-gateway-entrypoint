@@ -1,0 +1,37 @@
+#!/bin/sh
+# PID 1 entrypoint for agy-container git-gateway sidecar.
+# Materializes policy into a root-owned 0444 env file (because sshd clears
+# child environments) and stages the mounted host SSH key as 0400 owned by gitgw.
+
+set -eu
+
+POLICY_FILE="${AGY_GITGW_POLICY_FILE:-/run/git-gateway.env}"
+KEY_SRC="${AGY_GITGW_KEY_SRC:-/run/secrets/git-key}"
+KEY_DST="${AGY_GITGW_KEY_DST:-/run/git-key}"
+SSHD_BIN="${AGY_GITGW_SSHD:-/usr/sbin/sshd}"
+SSHD_CFG="${AGY_GITGW_SSHD_CFG:-/etc/ssh/sshd_config}"
+
+if [ ! -f "$KEY_SRC" ]; then
+  echo "[git-gateway] fatal: missing mounted SSH key at $KEY_SRC" >&2
+  exit 1
+fi
+
+# Copy and chmod 0400 BEFORE chown to gitgw (avoids requiring CAP_FOWNER under cap_drop=ALL).
+cp "$KEY_SRC" "$KEY_DST"
+chmod 0400 "$KEY_DST"
+chown gitgw:gitgw "$KEY_DST"
+
+# Escape single quotes for POSIX sh sourcing.
+sh_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+umask 022
+{
+  printf 'AGY_GITGW_POLICY_OK=1\n'
+  printf 'AGY_GITGW_PUSH=%s\n' "$(sh_quote "${AGY_GITGW_PUSH:-0}")"
+  printf 'AGY_GITGW_REPOS=%s\n' "$(sh_quote "${AGY_GITGW_REPOS:-}")"
+} > "$POLICY_FILE"
+chmod 0444 "$POLICY_FILE"
+
+exec "$SSHD_BIN" -D -e -f "$SSHD_CFG"

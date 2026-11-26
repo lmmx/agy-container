@@ -1,0 +1,14 @@
+ARG BASE_IMAGE=mirror.gcr.io/library/alpine:3.20
+FROM ${BASE_IMAGE}
+
+# Pinned Squid + system CA bundle (required for TLS upstream forwarding in the
+# zero-MITM GEMINI_API_KEY broker mode on port 3129).
+RUN apk add --no-cache squid=6.9-r0 ca-certificates \
+    && mkdir -p /etc/squid/conf.d /var/cache/squid \
+    && (chown -R squid:squid /var/cache/squid 2>/dev/null || true) \
+    && rm -f /etc/squid/squid.conf
+
+USER squid
+
+# Configuration files are always bind-mounted read-only at runtime.
+ENTRYPOINT ["squid", "-N", "-f", "/etc/squid/squid.conf"]
