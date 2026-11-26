@@ -1,0 +1,26 @@
+[package]
+name = "agy-container"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Run Google Antigravity CLI (agy) in a hardened rootless Podman container with default-deny egress and credential isolation"
+license = "MIT"
+repository = "https://github.com/lmmx/agy-container"
+
+[lib]
+name = "agy_container"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agy-container"
+path = "src/main.rs"
+
+# Zero external crate dependencies: everything is Rust std, deliberately.
+# A security boundary runner should have minimal supply-chain surface and
+# compile cleanly anywhere rustc is installed.
+[dependencies]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

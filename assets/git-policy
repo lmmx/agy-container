@@ -1,0 +1,147 @@
+#!/bin/sh
+# Forced command for agy-container git-gateway sidecar.
+# Validates SSH_ORIGINAL_COMMAND without eval, enforces read/write and repo
+# allowlist policy, logs every decision to stderr, and relays to GitHub.
+
+set -eu
+
+POLICY_FILE="${AGY_GITGW_POLICY_FILE:-/run/git-gateway.env}"
+KEY_DST="${AGY_GITGW_KEY_DST:-/run/git-key}"
+KNOWN_HOSTS="${AGY_GITGW_KNOWN_HOSTS:-/etc/ssh/github_known_hosts}"
+SSH_BIN="${AGY_GITGW_SSH:-ssh}"
+UPSTREAM="${AGY_GITGW_UPSTREAM:-git@github.com}"
+
+deny() {
+  echo "[git-gateway] DENY $1" >&2
+  exit 1
+}
+
+# Fail closed if the policy handoff file is missing or incomplete.
+if [ ! -r "$POLICY_FILE" ]; then
+  deny "missing policy file"
+fi
+AGY_GITGW_POLICY_OK=0
+AGY_GITGW_PUSH=0
+AGY_GITGW_REPOS=""
+# shellcheck disable=SC1090
+. "$POLICY_FILE"
+if [ "$AGY_GITGW_POLICY_OK" != "1" ]; then
+  deny "policy marker absent"
+fi
+
+ORIG="${SSH_ORIGINAL_COMMAND:-}"
+if [ -z "$ORIG" ]; then
+  deny "empty command (interactive shell forbidden)"
+fi
+
+# Reject newlines or any ASCII control characters anywhere in the command.
+if [ "$(printf '%s\n' "$ORIG" | wc -l)" -ne 1 ] || [ -n "$(printf '%s' "$ORIG" | LC_ALL=C tr -cd '[:cntrl:]')" ]; then
+  deny "control character in command"
+fi
+
+# Split into operation and single-quoted repository path without eval.
+op="${ORIG%% *}"
+rest="${ORIG#* }"
+if [ "$op" = "$ORIG" ] || [ -z "$rest" ]; then
+  deny "malformed command: $op"
+fi
+
+case "$op" in
+  git-upload-pack|git-upload-archive)
+    mode="read"
+    ;;
+  git-receive-pack)
+    mode="write"
+    if [ "$AGY_GITGW_PUSH" != "1" ]; then
+      deny "push disabled: $op"
+    fi
+    ;;
+  *)
+    deny "disallowed operation: $op"
+    ;;
+esac
+
+# Argument must be wrapped in single quotes with no embedded quotes or spaces.
+case "$rest" in
+  \'*\')
+    raw_repo="${rest#\'}"
+    raw_repo="${raw_repo%\'}"
+    ;;
+  *)
+    deny "unquoted repository path"
+    ;;
+esac
+
+if [ -z "$raw_repo" ]; then
+  deny "empty repository path"
+fi
+
+# Strict character allowlist: owner/repo with optional leading / and .git suffix.
+stripped="$(printf '%s' "$raw_repo" | tr -d 'A-Za-z0-9._/-')"
+if [ -n "$stripped" ]; then
+  deny "invalid characters in repository path: $raw_repo"
+fi
+
+case "$raw_repo" in
+  *..*|*//*|-*)
+    deny "unsafe repository path: $raw_repo"
+    ;;
+esac
+
+# Normalize to owner/repo for allowlist matching.
+norm_repo="${raw_repo#/}"
+norm_repo="${norm_repo%.git}"
+
+case "$norm_repo" in
+  */*)
+    owner="${norm_repo%%/*}"
+    name="${norm_repo#*/}"
+    case "$name" in
+      */*|"") deny "repository must be owner/repo: $raw_repo" ;;
+    esac
+    if [ -z "$owner" ]; then
+      deny "repository must be owner/repo: $raw_repo"
+    fi
+    ;;
+  *)
+    deny "repository must be owner/repo: $raw_repo"
+    ;;
+esac
+
+case "$owner" in
+  .|..|-*) deny "unsafe repository path: $raw_repo" ;;
+esac
+case "$name" in
+  .|..|-*) deny "unsafe repository path: $raw_repo" ;;
+esac
+
+if [ -n "$AGY_GITGW_REPOS" ]; then
+  allowed=0
+  set -f
+  OLD_IFS="$IFS"
+  IFS=','
+  for entry in $AGY_GITGW_REPOS; do
+    entry="${entry#/}"
+    entry="${entry%.git}"
+    if [ "$entry" = "$norm_repo" ]; then
+      allowed=1
+      break
+    fi
+  done
+  IFS="$OLD_IFS"
+  set +f
+  if [ "$allowed" != "1" ]; then
+    deny "repo not in allowlist: $norm_repo ($op)"
+  fi
+fi
+
+echo "[git-gateway] ALLOW $mode $op $norm_repo" >&2
+
+exec "$SSH_BIN" \
+  -i "$KEY_DST" \
+  -o IdentitiesOnly=yes \
+  -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes \
+  -o "UserKnownHostsFile=$KNOWN_HOSTS" \
+  "$UPSTREAM" \
+  "$op '$norm_repo.git'"
